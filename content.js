@@ -532,6 +532,388 @@
       return deduped;
     }
 
+    // ---- Reveal chain for hidden / nested matches -------------------------
+    //
+    // When the query lives inside something the user can't currently see —
+    // a closed dropdown, a closed `<details>`, an inactive tab panel, a
+    // generic `[hidden]` container, an `aria-controls`-driven popover, or
+    // any nested combination of those — VoiceMosh builds a "reveal chain":
+    // an ordered list of (trigger, hidden container) pairs leading from a
+    // visible starting point all the way down to the leaf element that
+    // actually contains the matching text. The Highlighter walks the chain
+    // step by step, dispatching the appropriate reveal action at each
+    // level, so the user sees a precise path from what they can see now to
+    // the exact target.
+    //
+    // The detection is fully generic — every recognizable hide/show
+    // pattern in HTML and ARIA is supported with the same code path:
+    //
+    //   • Native `<select>` (option lives in the browser-rendered popup)
+    //   • `<datalist>` paired with an `<input list>`
+    //   • `<details>` with non-summary children hidden when not `open`
+    //   • `[role="listbox"]`/`[role="menu"]`/`[role="menubar"]`/
+    //     `[role="combobox"]`/`[role="tree"]`/`[role="tablist"]`
+    //   • `[role="tabpanel"]` (paired with `[role="tab"]`)
+    //   • `[hidden]` attribute, `display:none`, `visibility:hidden`,
+    //     `aria-hidden="true"`, `opacity:0` containers
+    //   • Anything an element points at via `aria-controls`
+    //   • Submenu / nested popovers via `aria-haspopup` parent menuitems
+    //
+    // No per-component, per-library, or per-site logic.
+
+    function nodeIsClosedDetails(el) {
+      return el && el.tagName === 'DETAILS' && !el.open;
+    }
+
+    // Is `el` itself rendered hidden (independent of ancestors)?
+    function isElementSelfHidden(el) {
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+      if (el.hasAttribute('hidden')) return true;
+      if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return true;
+      try {
+        const cs = window.getComputedStyle(el);
+        if (!cs) return false;
+        if (cs.display === 'none') return true;
+        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return true;
+        const op = parseFloat(cs.opacity);
+        if (!Number.isNaN(op) && op < 0.05) return true;
+      } catch (_) { /* detached node */ }
+      return false;
+    }
+
+    // Does `container` hide `descendant`? Catches <details> (which hides
+    // non-summary children without changing computed styles) on top of the
+    // standard self-hidden checks.
+    function containerHidesDescendant(container, descendant) {
+      if (!container || !descendant) return false;
+      if (nodeIsClosedDetails(container)) {
+        const summary = container.querySelector(':scope > summary');
+        if (!summary || !summary.contains(descendant)) return true;
+        return false; // descendant is inside <summary>, visible.
+      }
+      return isElementSelfHidden(container);
+    }
+
+    // Walk up from `target` to find the closest ancestor that's hiding it.
+    // Returns null when nothing in the chain is hiding `target`.
+    function findClosestHidingAncestor(target) {
+      if (!target || !target.parentElement) return null;
+      // Native <option>/<optgroup> are rendered inside the closed picker
+      // popup, not the document — treat the <select> / <datalist> as the
+      // hiding ancestor so the user is guided to open the picker.
+      if (target.tagName === 'OPTION' || target.tagName === 'OPTGROUP') {
+        const native = target.closest('select, datalist');
+        if (native) return native;
+      }
+      let p = target.parentElement;
+      while (p && p.nodeType === Node.ELEMENT_NODE) {
+        if (containerHidesDescendant(p, target)) return p;
+        p = p.parentElement;
+      }
+      return null;
+    }
+
+    // Map a container's tag/role to a `kind` string the Highlighter uses
+    // to pick the right reveal action. Defined separately so every trigger-
+    // lookup branch tags the result consistently with the container's
+    // semantics, not the lookup mechanism that found it.
+    function classifyContainer(container) {
+      if (!container || !container.tagName) return 'unknown';
+      const tag = container.tagName.toLowerCase();
+      if (tag === 'select') return 'native-select';
+      if (tag === 'datalist') return 'datalist';
+      if (tag === 'details') return 'details';
+      const role = container.getAttribute && container.getAttribute('role');
+      if (role === 'menu' || role === 'menubar') return 'aria-menu';
+      if (role === 'combobox') return 'aria-combobox';
+      if (role === 'listbox') return 'aria-listbox';
+      if (role === 'tabpanel') return 'aria-tab';
+      if (role === 'tablist') return 'aria-tablist';
+      if (role === 'tree') return 'aria-tree';
+      return 'aria-controls';
+    }
+
+    // Find the trigger element that reveals a hidden container. The `kind`
+    // returned describes the container's semantics (so the Highlighter
+    // knows whether to set `details.open`, call `showPicker()`, dispatch a
+    // click, etc.) — it is NOT a description of how we found the trigger.
+    function findRevealTrigger(container) {
+      if (!container || !container.tagName) return null;
+      const tag = container.tagName.toLowerCase();
+      const role = container.getAttribute && container.getAttribute('role');
+      const kind = classifyContainer(container);
+
+      if (tag === 'select') return { trigger: container, kind };
+
+      if (tag === 'datalist') {
+        if (container.id && typeof CSS !== 'undefined' && CSS.escape) {
+          try {
+            const input = document.querySelector(`input[list="${CSS.escape(container.id)}"]`);
+            if (input) return { trigger: input, kind };
+          } catch (_) {}
+        }
+        return null;
+      }
+
+      if (tag === 'details' && !container.open) {
+        const summary = container.querySelector(':scope > summary');
+        return { trigger: summary || container, kind };
+      }
+
+      // 1. aria-controls referrer.
+      if (container.id && typeof CSS !== 'undefined' && CSS.escape) {
+        try {
+          const ctrl = document.querySelector(`[aria-controls~="${CSS.escape(container.id)}"]`);
+          if (ctrl && ctrl !== container && !container.contains(ctrl)) {
+            return { trigger: ctrl, kind };
+          }
+        } catch (_) { /* invalid selector */ }
+      }
+
+      // 2. Container's aria-labelledby — for tabpanels and ARIA dropdowns
+      //    the labelling element often IS the trigger.
+      const labelledBy = container.getAttribute && container.getAttribute('aria-labelledby');
+      if (labelledBy) {
+        const ids = labelledBy.split(/\s+/).filter(Boolean);
+        for (const id of ids) {
+          const ref = document.getElementById(id);
+          if (!ref || ref === container || container.contains(ref)) continue;
+          const looksLikeTrigger =
+            ref.tagName === 'BUTTON' ||
+            ref.getAttribute('role') === 'tab' ||
+            (ref.hasAttribute && (ref.hasAttribute('aria-haspopup') || ref.hasAttribute('aria-expanded')));
+          if (looksLikeTrigger) return { trigger: ref, kind };
+        }
+      }
+
+      // 3. Parent menuitem with aria-haspopup (nested submenu pattern).
+      const parent = container.parentElement;
+      if (parent && parent.hasAttribute) {
+        const parentRole = parent.getAttribute('role');
+        if (parentRole &&
+            ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option', 'treeitem', 'tab'].includes(parentRole) &&
+            (parent.hasAttribute('aria-haspopup') || parent.hasAttribute('aria-expanded'))) {
+          return { trigger: parent, kind };
+        }
+      }
+
+      // 4. Walk up to a near ancestor with aria-haspopup.
+      let p = container.parentElement;
+      let hops = 0;
+      while (p && hops < 6) {
+        if (p.hasAttribute && p.hasAttribute('aria-haspopup')) return { trigger: p, kind };
+        hops++;
+        p = p.parentElement;
+      }
+
+      // 5. Sibling button — preceding the container, then preceding the
+      //    container's wrapper (popups are often rendered next to a wrapper
+      //    div rather than the trigger itself).
+      const looksLikeTrigger = (sib) =>
+        sib && (sib.tagName === 'BUTTON' ||
+                (sib.hasAttribute && (sib.hasAttribute('aria-haspopup') || sib.hasAttribute('aria-expanded'))));
+      let sib = container.previousElementSibling;
+      while (sib) { if (looksLikeTrigger(sib)) return { trigger: sib, kind }; sib = sib.previousElementSibling; }
+      if (container.parentElement) {
+        sib = container.parentElement.previousElementSibling;
+        while (sib) { if (looksLikeTrigger(sib)) return { trigger: sib, kind }; sib = sib.previousElementSibling; }
+      }
+
+      return null;
+    }
+
+    // Walk up from the leaf target through every hidden ancestor in turn,
+    // building the reveal chain. Each entry is { container, trigger, kind,
+    // optionEl } where optionEl is "the thing the user needs to interact
+    // with at the previous level" (either an inner trigger, or the final
+    // matching element).
+    function getRevealChain(target) {
+      if (!target) return [];
+      const chain = [];
+      const seenContainers = new Set();
+      let current = target;
+      let safety = 20;
+
+      while (current && safety-- > 0) {
+        const hider = findClosestHidingAncestor(current);
+        if (!hider || seenContainers.has(hider)) break;
+        seenContainers.add(hider);
+
+        const trigInfo = findRevealTrigger(hider);
+        if (!trigInfo || !trigInfo.trigger) break;
+
+        chain.unshift({
+          container: hider,
+          trigger: trigInfo.trigger,
+          kind: trigInfo.kind,
+          optionEl: current,
+        });
+
+        if (trigInfo.trigger === hider) break; // self-trigger like <select>
+        current = trigInfo.trigger;
+      }
+
+      return chain;
+    }
+
+    // Display-friendly text for the highlight tooltip.
+    function getDisplayText(el) {
+      if (!el) return '';
+      const aria = el.getAttribute && el.getAttribute('aria-label');
+      if (aria) return aria.replace(/\s+/g, ' ').trim();
+      return (el.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    // Find the deepest descendant of `root` whose textContent contains the
+    // (already-normalized) query. Uses raw textContent so it works for
+    // descendants that are hidden — which is the whole point of this pass.
+    function findDeepestHiddenTextMatch(root, qNorm) {
+      if (!root || !qNorm) return null;
+      let result = null;
+      function visit(el) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+        const tag = el.tagName && el.tagName.toLowerCase();
+        if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'template') return false;
+        const text = normalize(el.textContent || '');
+        if (!text || !text.includes(qNorm)) return false;
+        let childMatched = false;
+        for (const child of el.children) {
+          if (visit(child)) childMatched = true;
+        }
+        if (!childMatched) result = el;
+        return true;
+      }
+      // Try the root itself first (covers <option> directly).
+      if (visit(root)) {
+        // If only the root matched (no deeper child), prefer the most
+        // specific option-like child if one exists and contains the text.
+        // Otherwise fall back to root.
+        if (!result) result = root;
+      }
+      return result;
+    }
+
+    // Find every hidden text match on the page and decorate each with a
+    // reveal chain. This is the universal "guide me to the hidden target"
+    // path, replacing the dropdown-only pass.
+    function findGuidedMatches(qNorm, opts) {
+      if (!qNorm) return [];
+      const results = [];
+      const claimedTargets = new WeakSet();
+      const startedAt = performance.now();
+      const timeoutMs = opts.timeoutMs ?? 500;
+
+      // Collect every recognizable "hidden region" in the document. We use
+      // a Set so a region pointed at by multiple selectors is deduped.
+      const regions = new Set();
+      const regionSelectors = [
+        'details:not([open])',
+        'select', 'datalist',
+        '[role="listbox"]', '[role="menu"]', '[role="menubar"]',
+        '[role="combobox"]', '[role="tree"]', '[role="tablist"]',
+        '[role="tabpanel"]',
+        '[hidden]',
+      ];
+      for (const sel of regionSelectors) {
+        try {
+          for (const r of document.querySelectorAll(sel)) regions.add(r);
+        } catch (_) { /* invalid selector */ }
+      }
+      // Also include every element pointed at by `aria-controls` — that's
+      // the canonical "popup / disclosure / panel" pattern in ARIA.
+      try {
+        for (const ctrl of document.querySelectorAll('[aria-controls]')) {
+          const idsAttr = ctrl.getAttribute('aria-controls') || '';
+          for (const id of idsAttr.split(/\s+/)) {
+            if (!id) continue;
+            const target = document.getElementById(id);
+            if (target) regions.add(target);
+          }
+        }
+      } catch (_) {}
+
+      for (const region of regions) {
+        if (performance.now() - startedAt > timeoutMs) break;
+        // Cheap reject — only proceed if the region's full textContent
+        // (which sees through hidden subtrees) contains the query.
+        const regionText = normalize(region.textContent || '');
+        if (!regionText || !regionText.includes(qNorm)) continue;
+
+        const deepest = findDeepestHiddenTextMatch(region, qNorm);
+        if (!deepest || claimedTargets.has(deepest)) continue;
+        claimedTargets.add(deepest);
+
+        const chain = getRevealChain(deepest);
+        if (!chain.length) continue;
+
+        const anchor = chain[0].trigger;
+        // The outermost trigger has to actually be visible — that's where
+        // the user starts. If it isn't, we don't have a usable starting
+        // point and the match is dropped (a more sophisticated future
+        // version could chain even deeper, but for an MVP this is fine).
+        if (!anchor || !isElementVisible(anchor)) continue;
+
+        results.push({
+          el: anchor,
+          score: 100,
+          reasons: ['guided-reveal'],
+          matchedByText: true,
+          kind: 'guided',
+          chain,
+          optionEl: deepest,
+          optionText: getDisplayText(deepest),
+        });
+      }
+
+      return results;
+    }
+
+    // Merge text-phase and guided-phase results, dropping any text match
+    // whose anchor is already covered by a guided chain (so we don't
+    // double-highlight the same `<select>` once as a flat text match and
+    // once as a guided reveal).
+    function mergeTextAndGuided(textMatches, guidedMatches) {
+      if (!guidedMatches.length) return textMatches;
+      const claimed = new Set();
+      for (const g of guidedMatches) {
+        for (const step of g.chain) {
+          claimed.add(step.container);
+          if (step.trigger) claimed.add(step.trigger);
+          if (step.optionEl) claimed.add(step.optionEl);
+        }
+        if (g.optionEl) claimed.add(g.optionEl);
+      }
+      const merged = guidedMatches.slice();
+      for (const t of textMatches) {
+        if (claimed.has(t.el)) continue;
+        let covered = false;
+        for (const g of guidedMatches) {
+          for (const step of g.chain) {
+            if (t.el === step.container || t.el === step.trigger ||
+                (step.container && (t.el.contains(step.container) || step.container.contains(t.el)))) {
+              covered = true; break;
+            }
+          }
+          if (covered) break;
+        }
+        if (!covered) merged.push(t);
+      }
+      // Sort by document order using each match's most specific anchor (the
+      // option for guided matches, the element for text matches).
+      merged.sort((a, b) => {
+        const aEl = (a.kind === 'guided' ? a.optionEl : null) || a.el;
+        const bEl = (b.kind === 'guided' ? b.optionEl : null) || b.el;
+        if (aEl === bEl) return 0;
+        try {
+          const pos = aEl.compareDocumentPosition(bEl);
+          if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+          if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        } catch (_) {}
+        return 0;
+      });
+      return merged;
+    }
+
     // ---- Public search ----------------------------------------------------
     function search(query, opts = {}) {
       const qNorm = normalize(query);
@@ -545,13 +927,16 @@
       const qSignificantTokens = meaningfulTokens(qNorm);
       const typeHint = detectTypeHint(qNorm);
 
-      // Phase 1: literal text. If any visible element contains the query in
-      // its text, return all such elements (deepest descendants, document
-      // order). We do NOT mix in semantic matches here — phase 1 succeeding
-      // means the user can see the literal text on the page, and any
-      // attribute-only candidate would be noise.
+      // Phase 1a: literal text in visible elements.
       const textMatches = findTextMatches(qNorm, opts);
-      if (textMatches.length) return textMatches;
+      // Phase 1b: text inside hidden / nested / collapsible structures,
+      //           each decorated with a reveal chain so the Highlighter can
+      //           guide the user step by step to the exact target.
+      const guidedMatches = findGuidedMatches(qNorm, opts);
+
+      if (textMatches.length || guidedMatches.length) {
+        return mergeTextAndGuided(textMatches, guidedMatches);
+      }
 
       // Phase 2: semantic fallback.
       return findSemanticMatches(qNorm, qSignificantTokens, typeHint, opts);
@@ -582,8 +967,15 @@
       pickResultsToShow,
       isElementVisible,
       getFullTextContent,
+      // Reveal chain — used by the Highlighter to drive the step-by-step
+      // open/highlight sequence, and exposed for tests.
+      getRevealChain,
+      findRevealTrigger,
+      findClosestHidingAncestor,
+      isElementSelfHidden,
       // Exposed for testing / future use.
       findTextMatches,
+      findGuidedMatches,
       findSemanticMatches,
     };
   })();
@@ -717,6 +1109,23 @@
       }
     }
 
+    function setLabelText(overlay, text) {
+      const span = overlay.labelEl.querySelector('span:not(.vm-close)');
+      if (span) span.textContent = text;
+    }
+
+    function defaultLabelFor(overlay, idx, total) {
+      if (overlay.match && overlay.match.kind === 'guided') {
+        const t = overlay.match.optionText || 'target';
+        return total > 1
+          ? `Step 1 — opens path to "${t}"  (${idx + 1}/${total})`
+          : `Step 1 — opens path to "${t}"`;
+      }
+      return total > 1
+        ? `VoiceMosh • ${idx + 1}/${total}`
+        : `VoiceMosh • match`;
+    }
+
     function highlight(matches, activeIdx = 0) {
       clear();
       ensureStyle();
@@ -727,12 +1136,7 @@
         ring.className = 'vm-ring';
         const label = document.createElement('div');
         label.className = 'vm-label';
-        label.innerHTML = '';
         const text = document.createElement('span');
-        const isActive = idx === activeIdx;
-        text.textContent = matches.length > 1
-          ? `VoiceMosh • ${idx + 1}/${matches.length}`
-          : `VoiceMosh • match`;
         const close = document.createElement('span');
         close.className = 'vm-close';
         close.textContent = '×';
@@ -745,7 +1149,16 @@
         label.appendChild(close);
         layer.appendChild(ring);
         layer.appendChild(label);
-        return { el: m.el, ringEl: ring, labelEl: label, score: m.score };
+        const overlay = {
+          el: m.el,
+          ringEl: ring,
+          labelEl: label,
+          score: m.score,
+          match: m,
+          chainRunId: 0,        // increments to cancel in-flight chain walks
+        };
+        text.textContent = defaultLabelFor(overlay, idx, matches.length);
+        return overlay;
       });
 
       setActive(activeIdx);
@@ -755,7 +1168,6 @@
       window.addEventListener('scroll', scrollHandler, true);
       window.addEventListener('resize', scrollHandler);
 
-      // Keep overlays glued to the elements as the page reflows (e.g. lazy-loaded content).
       try {
         resizeObserver = new ResizeObserver(() => render());
         for (const o of overlays) resizeObserver.observe(o.el);
@@ -771,16 +1183,175 @@
         o.ringEl.classList.toggle('active', isActive);
         o.ringEl.classList.toggle('dim', !isActive);
         o.labelEl.classList.toggle('dim', !isActive);
+        // Cancel any in-flight chain walks on overlays that are no longer
+        // active so they don't keep firing actions in the background.
+        if (!isActive) o.chainRunId = (o.chainRunId || 0) + 1;
       });
       const active = overlays[activeIndex];
       if (active && active.el.scrollIntoView) {
-        try {
-          active.el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
-        } catch (_) {
-          active.el.scrollIntoView();
-        }
+        try { active.el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' }); }
+        catch (_) { active.el.scrollIntoView(); }
       }
       render();
+      // If the active overlay represents a "guided" match (hidden target
+      // behind one or more layers), walk the reveal chain.
+      if (active && active.match && active.match.kind === 'guided') {
+        runRevealChain(active).catch(() => { /* may be cancelled mid-flight */ });
+      }
+    }
+
+    // ---- Reveal-chain walker ----------------------------------------------
+    //
+    // Walks through every step of the chain: highlight the trigger, label
+    // it with "Step k/N", apply the appropriate reveal action for the
+    // step's kind, wait for the next layer to become visible, then advance
+    // to the next step. The final step lands on the leaf option/element.
+
+    function dispatchClickSequence(el) {
+      if (!el) return;
+      const opts = { bubbles: true, cancelable: true, composed: true };
+      try {
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          const Evt = type.startsWith('pointer') && typeof PointerEvent === 'function'
+            ? PointerEvent
+            : (typeof MouseEvent === 'function' ? MouseEvent : Event);
+          el.dispatchEvent(new Evt(type, opts));
+        }
+      } catch (_) {
+        try { if (typeof el.click === 'function') el.click(); } catch (__) {}
+      }
+    }
+
+    async function applyRevealAction(step) {
+      const { kind, container, trigger } = step;
+      try {
+        switch (kind) {
+          case 'native-select': {
+            // Pre-select the matching option so when the native picker
+            // opens it lands on the answer.
+            try {
+              if (step.optionEl && 'value' in step.optionEl && step.optionEl.value !== undefined) {
+                container.value = step.optionEl.value;
+                container.dispatchEvent(new Event('change', { bubbles: true }));
+                container.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+            } catch (_) {}
+            try {
+              if (typeof container.showPicker === 'function') container.showPicker();
+            } catch (_) { /* needs a user gesture in some contexts */ }
+            return;
+          }
+          case 'datalist': {
+            // Focus the input and call showPicker if available.
+            try { if (trigger.focus) trigger.focus(); } catch (_) {}
+            try { if (typeof trigger.showPicker === 'function') trigger.showPicker(); } catch (_) {}
+            return;
+          }
+          case 'details': {
+            try { container.open = true; } catch (_) {}
+            // Some custom <details>-like components also listen for click.
+            dispatchClickSequence(trigger);
+            return;
+          }
+          default: {
+            // For everything click-driven (ARIA dropdowns, tabs, popovers,
+            // generic aria-controls).
+            const alreadyOpen = trigger && trigger.getAttribute &&
+              trigger.getAttribute('aria-expanded') === 'true';
+            if (!alreadyOpen) dispatchClickSequence(trigger);
+            return;
+          }
+        }
+      } catch (_) { /* non-fatal — chain walker will time out and proceed */ }
+    }
+
+    async function waitForVisible(el, timeoutMs = 1500) {
+      if (!el) return false;
+      const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      const start = now();
+      while (now() - start < timeoutMs) {
+        try {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            const cs = window.getComputedStyle(el);
+            if (cs && cs.display !== 'none' && cs.visibility !== 'hidden' &&
+                parseFloat(cs.opacity || '1') > 0.05) {
+              return true;
+            }
+          }
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return false;
+    }
+
+    async function runRevealChain(overlay) {
+      const match = overlay.match;
+      if (!match || !match.chain || !match.chain.length) return;
+      const runId = ++overlay.chainRunId;
+      const totalSteps = match.chain.length + 1;
+
+      // Native <select> short-circuit: we can't overlay the browser-rendered
+      // option popup, so just label the select with the option name and
+      // let `applyRevealAction` pre-select + try showPicker().
+      if (match.chain.length === 1 && match.chain[0].kind === 'native-select') {
+        const step = match.chain[0];
+        moveOverlayTo(overlay, step.container);
+        setLabelText(overlay, `Option "${match.optionText}" inside — click to open`);
+        await applyRevealAction(step);
+        return;
+      }
+
+      for (let i = 0; i < match.chain.length; i++) {
+        if (overlay.chainRunId !== runId) return; // cancelled
+        const step = match.chain[i];
+        const trigger = step.trigger;
+        if (!trigger) break;
+
+        moveOverlayTo(overlay, trigger);
+        const stepNum = i + 1;
+        setLabelText(overlay,
+          `Step ${stepNum}/${totalSteps} — open: "${match.optionText}"`);
+
+        await sleep(450);
+        if (overlay.chainRunId !== runId) return;
+
+        await applyRevealAction(step);
+
+        // Wait for the NEXT element in the chain to become visible — that's
+        // the next trigger for intermediate steps, or the leaf option for
+        // the final intermediate step.
+        const nextTarget = (i + 1 < match.chain.length)
+          ? match.chain[i + 1].trigger
+          : match.optionEl;
+        await waitForVisible(nextTarget, 1500);
+        if (overlay.chainRunId !== runId) return;
+      }
+
+      // Final step: land on the leaf option / target.
+      if (match.optionEl) {
+        moveOverlayTo(overlay, match.optionEl);
+        setLabelText(overlay, `Step ${totalSteps}/${totalSteps} — click "${match.optionText}"`);
+      }
+    }
+
+    function moveOverlayTo(overlay, newEl) {
+      if (!newEl || overlay.el === newEl) {
+        render();
+        return;
+      }
+      overlay.el = newEl;
+      try { if (resizeObserver) resizeObserver.observe(newEl); } catch (_) {}
+      try {
+        if (newEl.scrollIntoView) {
+          newEl.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+        }
+      } catch (_) {}
+      render();
+    }
+
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
     }
 
     function next() { setActive(activeIndex + 1); }
