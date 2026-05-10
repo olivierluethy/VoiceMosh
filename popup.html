@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=320" />
+  <title>VoiceMesh</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="vm-header">
+    <div class="vm-brand">
+      <span class="vm-dot" aria-hidden="true"></span>
+      <span class="vm-title">VoiceMesh</span>
+    </div>
+    <button id="vm-clear" class="vm-link" type="button" title="Remove highlights">Clear</button>
+  </header>
+
+  <form id="vm-form" autocomplete="off">
+    <label class="vm-label" for="vm-query">Find on this page</label>
+    <input
+      id="vm-query"
+      type="text"
+      placeholder="Describe what you're looking for…"
+      autocomplete="off"
+      autocorrect="off"
+      autocapitalize="off"
+      spellcheck="false"
+    />
+  </form>
+
+  <div id="vm-status" class="vm-status" aria-live="polite">Type a description and press Enter.</div>
+
+  <div id="vm-controls" class="vm-controls" hidden>
+    <button id="vm-prev" class="vm-btn" type="button" aria-label="Previous match">← Prev</button>
+    <span id="vm-counter" class="vm-counter">1 of 1</span>
+    <button id="vm-next" class="vm-btn" type="button" aria-label="Next match">Next →</button>
+  </div>
+
+  <footer class="vm-footer">
+    <span>Enter = search · ↑/↓ = cycle · Esc = clear</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
