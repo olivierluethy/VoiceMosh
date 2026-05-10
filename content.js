@@ -1,4 +1,4 @@
-// VoiceMesh — content script
+// VoiceMosh — content script
 // =============================
 // Responsibilities:
 //   1. Listen for messages from the popup / background (search, cycle, clear, toggle-panel).
@@ -11,39 +11,57 @@
 // Keep them decoupled so the scoring weights are easy to tune independently.
 
 (() => {
-  if (window.__voicemeshInstalled) return;
-  window.__voicemeshInstalled = true;
+  if (window.__voicemoshInstalled) return;
+  window.__voicemoshInstalled = true;
 
   // -----------------------------------------------------------------------------
-  //  Matcher — scoring elements against a textual query
+  //  Matcher — DOM-aware text and semantic locator
+  //
+  //  Two-phase search, in order:
+  //
+  //    1. LITERAL TEXT PHASE (primary).
+  //       Walk every visible element. Extract its full subtree text content
+  //       (including text fragmented across nested inline elements). If the
+  //       normalized subtree text contains the normalized query, this element
+  //       is a candidate. Then reduce to the deepest descendants — the leaf
+  //       elements that actually carry the matching string — so we don't
+  //       redundantly highlight every ancestor wrapper.
+  //       Returns ALL such matches, in document order. No top-N pruning,
+  //       no scoring biases. The user expects to see every occurrence.
+  //
+  //    2. SEMANTIC PHASE (fallback, only if phase 1 returned nothing).
+  //       Score elements against accessibility name (aria-label, title, alt),
+  //       attributes (placeholder, name, id, data-*), type hints in the query
+  //       (e.g. "button" → <button>), nearby <label> text, and tag/role.
+  //       This is what lets a query "Settings" find a magnifier-icon button
+  //       whose only label is aria-label="Settings".
+  //
+  //  The implementation is deliberately generic — there is no per-term, per-
+  //  language, or per-site logic. Any string the user types runs through the
+  //  same pipeline.
   // -----------------------------------------------------------------------------
   const Matcher = (() => {
-    // Scoring weights. These are intentionally chunky integers so the resulting
-    // confidence is easy to reason about when tuning.
+    // ---- Tunable constants ------------------------------------------------
+    // Weights for the SEMANTIC phase only. The text phase is unweighted —
+    // every literal text match gets returned.
     const W = {
-      exactText: 100,
-      fullPhraseInText: 70,
-      caseInsensitiveText: 60,
-      substringText: 35,
-      tokenOverlap: 25,           // multiplied by ratio of query tokens found
-      ariaLabelExact: 90,
-      ariaLabelSubstring: 50,
-      titleAttr: 40,
-      placeholderAttr: 40,
-      altAttr: 40,
+      ariaLabelExact: 100,
+      ariaLabelSubstring: 60,
+      titleAttr: 45,
+      placeholderAttr: 45,
+      altAttr: 45,
       nameOrId: 30,
       dataAttr: 18,
       roleMatch: 25,
       tagMatch: 25,
-      nearbyLabel: 30,
+      nearbyLabel: 35,
       interactive: 15,
+      tokenOverlap: 25,
+      fuzzyTokenMatch: 20,
       visible: 5,
-      // Penalties (subtractive)
-      huge: -10,                  // gigantic containers (whole page wrappers)
-      tooMuchText: -15,           // matched but text is enormous => low precision
     };
 
-    // Hint words that bias the search toward a particular element type.
+    // Hint words that bias the semantic phase toward a particular element kind.
     const TYPE_HINTS = [
       { words: ['button', 'btn'], tags: ['button'], roles: ['button'], extra: ['[type="button"]', '[type="submit"]'] },
       { words: ['link'], tags: ['a'], roles: ['link'] },
@@ -64,18 +82,27 @@
       'find', 'show', 'me', 'please', 'next', 'previous',
     ]);
 
+    // Per-search caches. Reset at the top of every `search()` call so we pick
+    // up DOM mutations between searches but pay each cost once per search.
+    let subtreeTextCache = new WeakMap();
+    let visibilityCache = new WeakMap();
+
+    // ---- Normalization ----------------------------------------------------
+    // Lowercase, strip zero-width / bidi marks, collapse whitespace runs,
+    // trim. Used identically on the query and on every text fragment we
+    // extract from the DOM, so they're comparable as plain strings.
     function normalize(str) {
       return (str || '')
         .toString()
         .toLowerCase()
-        .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '') // zero-widths / bidi
+        .replace(/[​-‏‪-‮⁠-⁯﻿]/g, '')
         .replace(/\s+/g, ' ')
         .trim();
     }
 
     function tokenize(str) {
       return normalize(str)
-        .split(/[^a-z0-9]+/i)
+        .split(/[^a-z0-9À-ɏ]+/i) // keep latin extended (umlauts etc.)
         .filter(Boolean);
     }
 
@@ -83,30 +110,170 @@
       return tokenize(str).filter((t) => !STOPWORDS.has(t) && t.length > 1);
     }
 
+    // ---- Visibility -------------------------------------------------------
+    // An element is "visible" if it has at least one positive-area client
+    // rect, isn't display:none / visibility:hidden / opacity:0 itself, and
+    // none of its ancestors are display:none / visibility:hidden.
+    //
+    // Using `getClientRects()` (rather than `getBoundingClientRect`) makes
+    // this robust for inline elements that wrap across line breaks — those
+    // have multiple positive-area rects even though the bounding box can
+    // collapse on weird layouts.
     function isElementVisible(el) {
-      if (!el || !(el instanceof Element)) return false;
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 1 || rect.height <= 1) return false;
-      const style = window.getComputedStyle(el);
-      if (
-        style.display === 'none' ||
-        style.visibility === 'hidden' ||
-        style.opacity === '0' ||
-        parseFloat(style.opacity || '1') < 0.05
-      ) {
-        return false;
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+      if (visibilityCache.has(el)) return visibilityCache.get(el);
+      const result = computeVisibility(el);
+      visibilityCache.set(el, result);
+      return result;
+    }
+
+    function computeVisibility(el) {
+      // Reject obviously-non-rendered tags up front.
+      const tag = el.tagName && el.tagName.toLowerCase();
+      if (!tag) return false;
+      if (tag === 'script' || tag === 'style' || tag === 'noscript' ||
+          tag === 'template' || tag === 'meta' || tag === 'link' ||
+          tag === 'head' || tag === 'title') return false;
+
+      const rects = el.getClientRects ? el.getClientRects() : null;
+      let hasArea = false;
+      if (rects && rects.length) {
+        for (const r of rects) {
+          if (r.width > 0 && r.height > 0) { hasArea = true; break; }
+        }
+      } else {
+        // Fallback for environments where getClientRects is unavailable.
+        const r = el.getBoundingClientRect && el.getBoundingClientRect();
+        if (r && r.width > 0 && r.height > 0) hasArea = true;
       }
-      // Walk up to make sure no ancestor hides us.
+      if (!hasArea) return false;
+
+      const cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      if (cs) {
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+        const op = parseFloat(cs.opacity);
+        if (!Number.isNaN(op) && op < 0.05) return false;
+      }
+      if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+
+      // Walk ancestors so we don't report visible nodes inside hidden subtrees.
       let p = el.parentElement;
       while (p) {
-        const ps = window.getComputedStyle(p);
-        if (ps.display === 'none' || ps.visibility === 'hidden') return false;
+        if (visibilityCache.has(p)) {
+          if (!visibilityCache.get(p)) return false;
+          break;
+        }
+        const ps = window.getComputedStyle ? window.getComputedStyle(p) : null;
+        if (ps && (ps.display === 'none' || ps.visibility === 'hidden' || ps.visibility === 'collapse')) {
+          return false;
+        }
+        if (p.getAttribute && p.getAttribute('aria-hidden') === 'true') return false;
         p = p.parentElement;
       }
       return true;
     }
 
-    // Cheap Levenshtein with early-exit cutoff to avoid pathological cost.
+    // ---- Text extraction --------------------------------------------------
+    // Recursively concatenate the text in `el`'s subtree (including open
+    // shadow roots). Skips <script>/<style>/<noscript>/<template> and
+    // aria-hidden subtrees. Cached per element per search.
+    //
+    // We concatenate WITHOUT inserting synthetic whitespace, mirroring the
+    // browser's native `Node.textContent` semantics. That way text that the
+    // page authored as one continuous word — even when split across nested
+    // inline elements like `<span>foo<em>bar</em>baz</span>` — reads back
+    // as "foobarbaz" so a substring search lands on it. Whitespace that
+    // exists in the source is preserved by the text nodes themselves and
+    // collapsed once at normalize() time.
+    function getFullTextContent(el) {
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) return '';
+      if (subtreeTextCache.has(el)) return subtreeTextCache.get(el);
+      const tag = el.tagName && el.tagName.toLowerCase();
+      if (!tag || tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'template') {
+        subtreeTextCache.set(el, '');
+        return '';
+      }
+      if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') {
+        subtreeTextCache.set(el, '');
+        return '';
+      }
+      let raw = '';
+      for (const node of el.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          if (node.nodeValue) raw += node.nodeValue;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          raw += getFullTextContent(node);
+        }
+      }
+      if (el.shadowRoot) {
+        for (const c of el.shadowRoot.childNodes) {
+          if (c.nodeType === Node.TEXT_NODE && c.nodeValue) raw += c.nodeValue;
+          else if (c.nodeType === Node.ELEMENT_NODE) raw += getFullTextContent(c);
+        }
+      }
+      const normalized = normalize(raw);
+      subtreeTextCache.set(el, normalized);
+      return normalized;
+    }
+
+    // Accessibility name, in roughly the order WAI-ARIA recommends.
+    function getAccessibleText(el) {
+      if (!el || !el.getAttribute) return '';
+      const aria = el.getAttribute('aria-label');
+      if (aria) return normalize(aria);
+      const labelledBy = el.getAttribute('aria-labelledby');
+      if (labelledBy) {
+        const ref = el.ownerDocument && el.ownerDocument.getElementById(labelledBy);
+        if (ref) return normalize(ref.textContent);
+      }
+      const title = el.getAttribute('title');
+      if (title) return normalize(title);
+      const alt = el.getAttribute('alt');
+      if (alt) return normalize(alt);
+      return '';
+    }
+
+    function getNearbyLabelText(el) {
+      if (!el) return '';
+      if (el.id && typeof CSS !== 'undefined' && CSS.escape) {
+        try {
+          const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+          if (lbl) return normalize(lbl.textContent);
+        } catch (_) { /* invalid selector — ignore */ }
+      }
+      const parentLabel = el.closest && el.closest('label');
+      if (parentLabel && parentLabel !== el) return normalize(parentLabel.textContent);
+      const prev = el.previousElementSibling;
+      if (prev && prev.tagName === 'LABEL') return normalize(prev.textContent);
+      return '';
+    }
+
+    function isInteractive(el) {
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName.toLowerCase();
+      if (['button', 'a', 'input', 'select', 'textarea', 'summary'].includes(tag)) return true;
+      const role = el.getAttribute && el.getAttribute('role');
+      if (role && ['button', 'link', 'checkbox', 'menuitem', 'tab', 'option', 'switch', 'radio'].includes(role)) {
+        return true;
+      }
+      if (el.hasAttribute && el.hasAttribute('onclick')) return true;
+      if (typeof el.tabIndex === 'number' && el.tabIndex >= 0) return true;
+      try {
+        const cs = window.getComputedStyle(el);
+        if (cs && cs.cursor === 'pointer') return true;
+      } catch (_) { /* style may be unavailable in detached nodes */ }
+      return false;
+    }
+
+    function detectTypeHint(query) {
+      const tokens = tokenize(query);
+      for (const hint of TYPE_HINTS) {
+        if (hint.words.some((w) => tokens.includes(w))) return hint;
+      }
+      return null;
+    }
+
+    // ---- Levenshtein (capped) for fuzzy semantic matching ----------------
     function levenshtein(a, b, cutoff = 4) {
       if (a === b) return 0;
       if (Math.abs(a.length - b.length) > cutoff) return cutoff + 1;
@@ -131,7 +298,6 @@
     }
 
     function fuzzyTokenMatch(needle, haystackTokens) {
-      // Returns true if any haystack token is within Levenshtein distance 1-2 of needle.
       const cutoff = needle.length <= 4 ? 1 : 2;
       for (const t of haystackTokens) {
         if (Math.abs(t.length - needle.length) > cutoff) continue;
@@ -140,81 +306,21 @@
       return false;
     }
 
-    // Get the visible text of an element, but cap depth/length to keep this cheap.
-    function getOwnText(el) {
-      let txt = '';
-      for (const node of el.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) txt += node.textContent + ' ';
-      }
-      return normalize(txt);
-    }
-
-    function getAccessibleText(el) {
-      // Prefer accessible name sources in roughly the order WAI-ARIA spec recommends.
-      const aria = el.getAttribute('aria-label');
-      if (aria) return normalize(aria);
-      const labelledBy = el.getAttribute('aria-labelledby');
-      if (labelledBy) {
-        const ref = document.getElementById(labelledBy);
-        if (ref) return normalize(ref.textContent);
-      }
-      const title = el.getAttribute('title');
-      if (title) return normalize(title);
-      const alt = el.getAttribute('alt');
-      if (alt) return normalize(alt);
-      return '';
-    }
-
-    function getNearbyLabelText(el) {
-      // Associated <label> for form fields.
-      if (el.id) {
-        const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-        if (lbl) return normalize(lbl.textContent);
-      }
-      const parentLabel = el.closest('label');
-      if (parentLabel && parentLabel !== el) return normalize(parentLabel.textContent);
-      // Previous-sibling label heuristic.
-      const prev = el.previousElementSibling;
-      if (prev && prev.tagName === 'LABEL') return normalize(prev.textContent);
-      return '';
-    }
-
-    function isInteractive(el) {
-      const tag = el.tagName.toLowerCase();
-      if (['button', 'a', 'input', 'select', 'textarea', 'summary'].includes(tag)) return true;
-      const role = el.getAttribute('role');
-      if (role && ['button', 'link', 'checkbox', 'menuitem', 'tab', 'option', 'switch', 'radio'].includes(role)) {
-        return true;
-      }
-      if (el.hasAttribute('onclick') || el.tabIndex >= 0) return true;
-      const cursor = window.getComputedStyle(el).cursor;
-      if (cursor === 'pointer') return true;
-      return false;
-    }
-
-    function detectTypeHint(query) {
-      const tokens = tokenize(query);
-      for (const hint of TYPE_HINTS) {
-        if (hint.words.some((w) => tokens.includes(w))) return hint;
-      }
-      return null;
-    }
-
-    // Walk the DOM (including open shadow roots) and yield candidate elements.
-    function* walk(root) {
+    // ---- DOM walk (incl. open shadow roots) -------------------------------
+    function* walkElements(root) {
       const stack = [root];
       while (stack.length) {
         const node = stack.pop();
-        if (!node) continue;
-        if (node.nodeType !== Node.ELEMENT_NODE && node !== document) continue;
-
-        if (node instanceof Element) {
-          const tag = node.tagName.toLowerCase();
-          if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'meta' || tag === 'link') continue;
-          yield node;
-          if (node.shadowRoot) stack.push(...node.shadowRoot.children);
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+        const tag = node.tagName && node.tagName.toLowerCase();
+        if (!tag || tag === 'script' || tag === 'style' || tag === 'noscript' ||
+            tag === 'template' || tag === 'meta' || tag === 'link') continue;
+        yield node;
+        if (node.shadowRoot) {
+          for (let i = node.shadowRoot.children.length - 1; i >= 0; i--) {
+            stack.push(node.shadowRoot.children[i]);
+          }
         }
-
         const children = node.children;
         if (children) {
           for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
@@ -222,72 +328,100 @@
       }
     }
 
-    function scoreElement(el, ctx) {
-      const { qNorm, qTokens, qSignificantTokens, typeHint } = ctx;
+    // ---- Phase 1: literal text pass ---------------------------------------
+    // Find every visible element whose subtree text contains the query. Then
+    // reduce to deepest-only — an element is dropped if any of its
+    // descendants is also a match (the descendant carries the actual text).
+    //
+    // Returns matches in document order so cycling next/prev moves predictably
+    // top-to-bottom, left-to-right through the page.
+    function findTextMatches(qNorm, opts) {
+      if (!qNorm) return [];
+      const startedAt = performance.now();
+      const timeoutMs = opts.timeoutMs ?? 500;
+      const maxCandidates = opts.maxCandidates ?? 12000;
+
+      const all = [];
+      let count = 0;
+      for (const el of walkElements(document.documentElement)) {
+        count++;
+        if (count > maxCandidates) break;
+        if ((count & 511) === 0 && performance.now() - startedAt > timeoutMs) break;
+        if (!isElementVisible(el)) continue;
+        const text = getFullTextContent(el);
+        if (text && text.includes(qNorm)) all.push(el);
+      }
+
+      if (!all.length) return [];
+
+      // Reduce to deepest-only. We rely on the document-order property of
+      // walkElements: a parent is always emitted before its descendants, so
+      // we can scan once and drop any element whose immediately-following
+      // siblings/descendants also matched.
+      //
+      // For the typical case (a handful of matches) the O(k²) check below
+      // is trivial. We cap k at 200 to keep this fast on pathological
+      // pages where the query is e.g. a single common letter.
+      const limited = all.slice(0, 200);
+      const deepest = [];
+      for (let i = 0; i < limited.length; i++) {
+        const a = limited[i];
+        let hasMatchingDescendant = false;
+        for (let j = 0; j < limited.length; j++) {
+          if (i === j) continue;
+          const b = limited[j];
+          if (a.contains(b)) { hasMatchingDescendant = true; break; }
+        }
+        if (!hasMatchingDescendant) deepest.push(a);
+      }
+
+      // Document order — compareDocumentPosition is the canonical answer.
+      deepest.sort((a, b) => {
+        if (a === b) return 0;
+        const pos = a.compareDocumentPosition(b);
+        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+      });
+
+      return deepest.map((el) => ({
+        el,
+        score: 100,
+        reasons: ['text-match'],
+        matchedByText: true,
+      }));
+    }
+
+    // ---- Phase 2: semantic fallback ---------------------------------------
+    // Only runs when phase 1 returns nothing. Scores elements based on
+    // accessibility name, attributes, type hints, label association, and
+    // role/tag. This is what makes a query "Search" still find an icon
+    // button whose only handle is aria-label="Search".
+    function scoreSemantic(el, qNorm, qSignificantTokens, typeHint) {
       const reasons = [];
       let score = 0;
 
-      const ownText = getOwnText(el);
       const accText = getAccessibleText(el);
-      const placeholder = normalize(el.getAttribute && el.getAttribute('placeholder'));
-      const nameAttr = normalize(el.getAttribute && el.getAttribute('name'));
-      const idAttr = normalize(el.id);
-      const tag = el.tagName.toLowerCase();
-      const role = (el.getAttribute && el.getAttribute('role')) || '';
-
-      // 1. Visible text matching (heaviest weight when text is concise).
-      if (ownText) {
-        if (ownText === qNorm) {
-          score += W.exactText; reasons.push('exact-text');
-        } else if (ownText.includes(qNorm)) {
-          score += W.fullPhraseInText; reasons.push('phrase-in-text');
-        } else {
-          const ownTokens = tokenize(ownText);
-          if (qSignificantTokens.length) {
-            const hits = qSignificantTokens.filter((t) => ownTokens.includes(t)).length;
-            if (hits === qSignificantTokens.length) {
-              score += W.caseInsensitiveText; reasons.push('all-tokens-text');
-            } else if (hits > 0) {
-              score += Math.round(W.tokenOverlap * (hits / qSignificantTokens.length));
-              reasons.push(`token-overlap-${hits}/${qSignificantTokens.length}`);
-            } else {
-              // Fuzzy fallback for typos.
-              const fuzzyHits = qSignificantTokens.filter((t) => fuzzyTokenMatch(t, ownTokens)).length;
-              if (fuzzyHits > 0) {
-                score += Math.round(W.substringText * (fuzzyHits / qSignificantTokens.length));
-                reasons.push(`fuzzy-${fuzzyHits}`);
-              }
-            }
-          }
-          if (ownText.length < 240 && qNorm.length >= 3 && ownText.includes(qNorm.slice(0, Math.max(3, qNorm.length - 1)))) {
-            score += 5;
-          }
-        }
-
-        // Penalize elements with massive amounts of text — they likely match by accident.
-        if (ownText.length > 400) {
-          score += W.tooMuchText;
-          reasons.push('penalty-too-much-text');
-        }
-      }
-
-      // 2. Accessible-name attributes.
       if (accText) {
         if (accText === qNorm) {
           score += W.ariaLabelExact; reasons.push('aria-exact');
         } else if (accText.includes(qNorm)) {
           score += W.ariaLabelSubstring; reasons.push('aria-substring');
-        } else {
-          const t = tokenize(accText);
-          const hits = qSignificantTokens.filter((x) => t.includes(x)).length;
-          if (hits > 0 && qSignificantTokens.length) {
-            score += Math.round(W.ariaLabelSubstring * (hits / qSignificantTokens.length));
-            reasons.push(`aria-tokens-${hits}`);
+        } else if (qSignificantTokens.length) {
+          const accTokens = tokenize(accText);
+          const hits = qSignificantTokens.filter((t) => accTokens.includes(t)).length;
+          if (hits === qSignificantTokens.length) {
+            score += W.ariaLabelSubstring; reasons.push('aria-all-tokens');
+          } else if (hits > 0) {
+            score += Math.round(W.tokenOverlap * (hits / qSignificantTokens.length));
+            reasons.push(`aria-token-overlap-${hits}/${qSignificantTokens.length}`);
+          } else if (fuzzyTokenMatch(qNorm, accTokens)) {
+            score += W.fuzzyTokenMatch; reasons.push('aria-fuzzy');
           }
         }
       }
 
-      // 3. Placeholder / alt / title / name / id / data-*.
+      const placeholder = normalize(el.getAttribute && el.getAttribute('placeholder'));
       if (placeholder && (placeholder === qNorm || placeholder.includes(qNorm))) {
         score += W.placeholderAttr; reasons.push('placeholder');
       }
@@ -299,15 +433,16 @@
       if (altAttr && altAttr.includes(qNorm)) {
         score += W.altAttr; reasons.push('alt');
       }
+      const nameAttr = normalize(el.getAttribute && el.getAttribute('name'));
       if (nameAttr && (nameAttr === qNorm || nameAttr.includes(qNorm))) {
         score += W.nameOrId; reasons.push('name');
       }
+      const idAttr = normalize(el.id);
       if (idAttr && (idAttr === qNorm || idAttr.includes(qNorm))) {
         score += W.nameOrId; reasons.push('id');
       }
 
-      // data-* attributes (test-ids, hooks, etc.).
-      if (el.attributes && qSignificantTokens.length) {
+      if (el.attributes && qNorm) {
         for (const attr of el.attributes) {
           if (!attr.name.startsWith('data-')) continue;
           const v = normalize(attr.value);
@@ -319,9 +454,10 @@
         }
       }
 
-      // 4. Type-hint matching (e.g. user said "button").
       if (typeHint) {
-        if (typeHint.tags.includes(tag)) {
+        const tag = el.tagName.toLowerCase();
+        const role = (el.getAttribute && el.getAttribute('role')) || '';
+        if (typeHint.tags && typeHint.tags.includes(tag)) {
           score += W.tagMatch; reasons.push(`tag:${tag}`);
         }
         if (role && typeHint.roles && typeHint.roles.includes(role)) {
@@ -331,84 +467,60 @@
           for (const sel of typeHint.extra) {
             try {
               if (el.matches(sel)) { score += W.tagMatch; reasons.push(`extra:${sel}`); break; }
-            } catch (_) { /* invalid selector — ignore */ }
+            } catch (_) { /* ignore invalid selectors */ }
           }
         }
       }
 
-      // 5. Nearby label (for icon-only buttons / unlabeled inputs).
-      if (score < W.ariaLabelExact) {
+      if (!reasons.length) {
         const nearby = getNearbyLabelText(el);
         if (nearby && (nearby === qNorm || nearby.includes(qNorm))) {
           score += W.nearbyLabel; reasons.push('nearby-label');
         }
       }
 
-      // 6. Interactivity boost — most queries are about something the user wants to click.
-      if (isInteractive(el)) {
-        score += W.interactive;
-      }
-
-      // 7. Visibility check (we filter invisible elements separately, but boost stable on-screen ones).
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
+      // Tie-breakers — only applied when at least one real match reason fired.
+      if (reasons.length) {
+        if (isInteractive(el)) score += W.interactive;
         score += W.visible;
-        // Penalize gigantic containers — they're rarely the user's target.
-        const area = rect.width * rect.height;
-        const viewportArea = window.innerWidth * window.innerHeight;
-        if (area > viewportArea * 0.6) {
-          score += W.huge;
-          reasons.push('penalty-huge');
-        }
       }
 
       return { score, reasons };
     }
 
-    function search(query, opts = {}) {
-      const qNorm = normalize(query);
-      if (!qNorm) return [];
-      const qTokens = tokenize(qNorm);
-      const qSignificantTokens = meaningfulTokens(qNorm);
-      const typeHint = detectTypeHint(qNorm);
-
-      const ctx = { qNorm, qTokens, qSignificantTokens, typeHint };
+    function findSemanticMatches(qNorm, qSignificantTokens, typeHint, opts) {
+      const results = [];
       const startedAt = performance.now();
       const timeoutMs = opts.timeoutMs ?? 500;
-      const maxCandidates = opts.maxCandidates ?? 8000;
-
-      const results = [];
+      const maxCandidates = opts.maxCandidates ?? 12000;
       let count = 0;
 
-      for (const el of walk(document.documentElement)) {
+      for (const el of walkElements(document.documentElement)) {
         count++;
         if (count > maxCandidates) break;
         if ((count & 511) === 0 && performance.now() - startedAt > timeoutMs) break;
-
         if (!isElementVisible(el)) continue;
-
-        const { score, reasons } = scoreElement(el, ctx);
-        if (score <= 0) continue;
-        results.push({ el, score, reasons });
+        const { score, reasons } = scoreSemantic(el, qNorm, qSignificantTokens, typeHint);
+        if (!reasons.length || score <= 0) continue;
+        results.push({ el, score, reasons, matchedByText: false });
       }
 
       results.sort((a, b) => b.score - a.score);
 
-      // De-duplicate: if a parent and child both match strongly, prefer the more specific
-      // (smaller / inner) one when their scores are within 15% of each other.
+      // Parent/child dedup. For semantic matches we keep the parent unless
+      // a descendant scores at least 85% — this preserves "the button is
+      // the click target" behavior when the parent matches via aria-label
+      // and a child happens to share text.
       const deduped = [];
       for (const r of results) {
         let skip = false;
         for (const kept of deduped) {
           if (kept.el.contains(r.el) && r.score >= kept.score * 0.85) {
-            // child is similarly strong — replace parent.
-            const idx = deduped.indexOf(kept);
-            deduped.splice(idx, 1, r);
+            deduped[deduped.indexOf(kept)] = r;
             skip = true;
             break;
           }
           if (r.el.contains(kept.el) && kept.score >= r.score * 0.85) {
-            // parent is weaker than kept child — drop parent.
             skip = true;
             break;
           }
@@ -420,15 +532,69 @@
       return deduped;
     }
 
-    return { search, isElementVisible };
+    // ---- Public search ----------------------------------------------------
+    function search(query, opts = {}) {
+      const qNorm = normalize(query);
+      if (!qNorm) return [];
+
+      // Reset per-search caches — the page may have rerendered since the
+      // last search.
+      subtreeTextCache = new WeakMap();
+      visibilityCache = new WeakMap();
+
+      const qSignificantTokens = meaningfulTokens(qNorm);
+      const typeHint = detectTypeHint(qNorm);
+
+      // Phase 1: literal text. If any visible element contains the query in
+      // its text, return all such elements (deepest descendants, document
+      // order). We do NOT mix in semantic matches here — phase 1 succeeding
+      // means the user can see the literal text on the page, and any
+      // attribute-only candidate would be noise.
+      const textMatches = findTextMatches(qNorm, opts);
+      if (textMatches.length) return textMatches;
+
+      // Phase 2: semantic fallback.
+      return findSemanticMatches(qNorm, qSignificantTokens, typeHint, opts);
+    }
+
+    // Decide which subset of search results to actually highlight.
+    //   - Text matches (phase 1): return all of them, capped at 50 to keep
+    //     the highlight layer manageable on pages where the query is very
+    //     common (e.g. a single letter).
+    //   - Semantic matches (phase 2): if the top score dominates, return
+    //     just the top. If several near-tie, return up to 10 so the user
+    //     can cycle through similarly-good candidates.
+    function pickResultsToShow(results, opts = {}) {
+      if (!results.length) return [];
+      if (results[0].matchedByText) {
+        return results.slice(0, opts.maxTextMatches ?? 50);
+      }
+      const top = results[0].score;
+      const close = results.filter((r) => r.score >= top * 0.7);
+      if (close.length === 1) return close;
+      const exactTies = close.filter((r) => r.score === top).length;
+      const cap = exactTies >= 3 ? Math.min(close.length, 10) : 3;
+      return close.slice(0, cap);
+    }
+
+    return {
+      search,
+      pickResultsToShow,
+      isElementVisible,
+      getFullTextContent,
+      // Exposed for testing / future use.
+      findTextMatches,
+      findSemanticMatches,
+    };
   })();
+
 
   // -----------------------------------------------------------------------------
   //  Highlighter — visual overlays that don't interfere with the page
   // -----------------------------------------------------------------------------
   const Highlighter = (() => {
-    const LAYER_ID = '__voicemesh_layer__';
-    const STYLE_ID = '__voicemesh_style__';
+    const LAYER_ID = '__voicemosh_layer__';
+    const STYLE_ID = '__voicemosh_style__';
     let overlays = [];          // [{ el, ringEl, labelEl, score, isActive }]
     let activeIndex = 0;
     let resizeObserver = null;
@@ -565,8 +731,8 @@
         const text = document.createElement('span');
         const isActive = idx === activeIdx;
         text.textContent = matches.length > 1
-          ? `VoiceMesh • ${idx + 1}/${matches.length}`
-          : `VoiceMesh • match`;
+          ? `VoiceMosh • ${idx + 1}/${matches.length}`
+          : `VoiceMosh • match`;
         const close = document.createElement('span');
         close.className = 'vm-close';
         close.textContent = '×';
@@ -629,7 +795,7 @@
   //  Floating in-page panel (alternative to the popup)
   // -----------------------------------------------------------------------------
   const Panel = (() => {
-    const PANEL_ID = '__voicemesh_panel__';
+    const PANEL_ID = '__voicemosh_panel__';
     let lastResults = [];
 
     function buildPanel() {
@@ -650,7 +816,7 @@
       `;
       panel.innerHTML = `
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
-          <strong style="font-size:13px; letter-spacing:0.02em;">VoiceMesh</strong>
+          <strong style="font-size:13px; letter-spacing:0.02em;">VoiceMosh</strong>
           <button id="__vm_close" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer;line-height:1;">×</button>
         </div>
         <input id="__vm_input" type="text" placeholder="Describe what you're looking for…"
@@ -726,9 +892,7 @@
         controlsEl.style.display = 'none';
         return;
       }
-      const top = results[0].score;
-      const close = results.filter((r) => r.score >= top * 0.7);
-      const toShow = close.length === 1 ? close.slice(0, 1) : close.slice(0, 3);
+      const toShow = Matcher.pickResultsToShow(results);
       Highlighter.highlight(toShow, 0);
       statusEl.textContent = toShow.length === 1
         ? 'Found 1 match'
@@ -753,11 +917,11 @@
     if (!msg || typeof msg.type !== 'string') return false;
     try {
       switch (msg.type) {
-        case 'voicemesh:ping':
+        case 'voicemosh:ping':
           sendResponse({ ok: true });
           return true;
 
-        case 'voicemesh:search': {
+        case 'voicemosh:search': {
           const results = Matcher.search(msg.query || '');
           if (!results.length) {
             Highlighter.clear();
@@ -765,8 +929,7 @@
             return true;
           }
           const top = results[0].score;
-          const close = results.filter((r) => r.score >= top * 0.7);
-          const toShow = close.length === 1 ? close.slice(0, 1) : close.slice(0, 3);
+          const toShow = Matcher.pickResultsToShow(results);
           Highlighter.highlight(toShow, 0);
           sendResponse({
             ok: true,
@@ -779,22 +942,22 @@
           return true;
         }
 
-        case 'voicemesh:next':
+        case 'voicemosh:next':
           Highlighter.next();
           sendResponse({ ok: true, activeIndex: Highlighter.getActiveIndex(), count: Highlighter.getCount() });
           return true;
 
-        case 'voicemesh:prev':
+        case 'voicemosh:prev':
           Highlighter.prev();
           sendResponse({ ok: true, activeIndex: Highlighter.getActiveIndex(), count: Highlighter.getCount() });
           return true;
 
-        case 'voicemesh:clear':
+        case 'voicemosh:clear':
           Highlighter.clear();
           sendResponse({ ok: true });
           return true;
 
-        case 'voicemesh:toggle-panel':
+        case 'voicemosh:toggle-panel':
           Panel.toggle();
           sendResponse({ ok: true });
           return true;

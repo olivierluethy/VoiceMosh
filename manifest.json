@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "VoiceMesh",
+  "name": "VoiceMosh",
   "version": "0.1.0",
-  "description": "Type what you're looking for and VoiceMesh highlights it on the page.",
+  "description": "Type what you're looking for and VoiceMosh highlights it on the page.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "VoiceMesh — find it on the page",
+    "default_title": "VoiceMosh — find it on the page",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -36,7 +36,7 @@
         "default": "Ctrl+Shift+F",
         "mac": "Command+Shift+F"
       },
-      "description": "Open VoiceMesh"
+      "description": "Open VoiceMosh"
     },
     "toggle-panel": {
       "suggested_key": {

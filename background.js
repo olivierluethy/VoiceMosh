@@ -1,4 +1,4 @@
-// VoiceMesh — background service worker (MV3)
+// VoiceMosh — background service worker (MV3)
 // Forwards keyboard-shortcut commands to the active tab and ensures the
 // content script is alive before the popup tries to talk to it.
 
@@ -10,14 +10,14 @@ chrome.commands.onCommand.addListener(async (command) => {
   if (!tab?.id) return;
   await ensureContentScript(tab.id);
   try {
-    await chrome.tabs.sendMessage(tab.id, { type: 'voicemesh:toggle-panel' });
+    await chrome.tabs.sendMessage(tab.id, { type: 'voicemosh:toggle-panel' });
   } catch (err) {
     // Tab may not be a regular web page (chrome://, file://, etc.) — silently ignore.
   }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type === 'voicemesh:ensure-content') {
+  if (msg?.type === 'voicemosh:ensure-content') {
     const tabId = msg.tabId ?? sender.tab?.id;
     if (!tabId) {
       sendResponse({ ok: false, error: 'no-tab' });
@@ -34,7 +34,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 async function ensureContentScript(tabId) {
   // Ping first; only inject if no listener is registered.
   try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: 'voicemesh:ping' });
+    const res = await chrome.tabs.sendMessage(tabId, { type: 'voicemosh:ping' });
     if (res?.ok) return;
   } catch (_) {
     // No content script yet — fall through to injection.

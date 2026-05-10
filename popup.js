@@ -1,4 +1,4 @@
-// VoiceMesh — popup controller
+// VoiceMosh — popup controller
 // Bridges the popup form to the active tab's content script.
 
 const $form = document.getElementById('vm-form');
@@ -47,11 +47,11 @@ async function send(message) {
   const tab = await getActiveTab();
   if (!tab?.id) throw new Error('No active tab.');
   if (tab.url && /^(chrome|edge|brave|about|chrome-extension):/.test(tab.url)) {
-    throw new Error('VoiceMesh can\'t run on this page.');
+    throw new Error('VoiceMosh can\'t run on this page.');
   }
   // Make sure the content script is injected before sending.
   await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'voicemesh:ensure-content', tabId: tab.id }, () => resolve());
+    chrome.runtime.sendMessage({ type: 'voicemosh:ensure-content', tabId: tab.id }, () => resolve());
   });
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tab.id, message, (response) => {
@@ -72,7 +72,7 @@ async function runSearch(query) {
   setStatus('Searching…');
   try {
     chrome.storage?.local.set({ lastQuery: q });
-    const res = await send({ type: 'voicemesh:search', query: q });
+    const res = await send({ type: 'voicemosh:search', query: q });
     if (!res?.ok) {
       setStatus(res?.error || 'Search failed.', 'error');
       setControls(0);
@@ -115,7 +115,7 @@ $input.addEventListener('keydown', (e) => {
 
 async function cycle(direction) {
   try {
-    const res = await send({ type: direction === 'next' ? 'voicemesh:next' : 'voicemesh:prev' });
+    const res = await send({ type: direction === 'next' ? 'voicemosh:next' : 'voicemosh:prev' });
     if (res?.ok && res.count) {
       setControls(res.count, res.activeIndex || 0);
     }
@@ -129,7 +129,7 @@ $next.addEventListener('click', () => cycle('next'));
 
 async function runClear() {
   try {
-    await send({ type: 'voicemesh:clear' });
+    await send({ type: 'voicemosh:clear' });
     setStatus('Highlights cleared.');
     setControls(0);
   } catch (err) {
